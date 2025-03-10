@@ -5142,6 +5142,8 @@ const (
 	LS_NLRI_TYPE_LINK
 	LS_NLRI_TYPE_PREFIX_IPV4
 	LS_NLRI_TYPE_PREFIX_IPV6
+	LS_NLRI_TYPE_SR_POLICY_CANDIDATE_PATH
+	LS_NLRI_TYPE_SRV6_SID
 )
 
 type LsNLRIInterface interface {
@@ -5841,6 +5843,236 @@ func (l *LsPrefixV6NLRI) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// TODO: LsSrPolicyiCandidatePathNLRI
+
+type LsTLVSrv6SIDInfo struct {
+	LsTLV
+	SIDs []net.IP
+}
+
+func (l *LsTLVSrv6SIDInfo) DecodeFromBytes(data []byte) error {
+	sid, err := l.LsTLV.DecodeFromBytes(data)
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < len(sid)/16; i++ {
+		l.SIDs = append(l.SIDs, net.IP(sid[i*16:i*16+16]))
+	}
+
+	return nil
+}
+
+func (l *LsTLVSrv6SIDInfo) Serialize() ([]byte, error) {
+	buf := []byte{}
+
+	for _, sid := range l.SIDs {
+		buf = append(buf, sid...)
+	}
+
+	return l.LsTLV.Serialize(buf)
+}
+
+func (l *LsTLVSrv6SIDInfo) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Type LsTLVType `json:"type"`
+		SIDs []string  `json:"sids"`
+	}{
+		l.Type,
+		l.Strings(),
+	})
+}
+
+func (l *LsTLVSrv6SIDInfo) Strings() []string {
+	sidStrings := []string{}
+	for _, sid := range l.SIDs {
+		sidStrings = append(sidStrings, sid.String())
+	}
+
+	return sidStrings
+}
+
+func (l *LsTLVSrv6SIDInfo) String() string {
+	return fmt.Sprintf("{SIDs: %s}", strings.Join(l.Strings(), ", "))
+}
+
+func (l *LsTLVSrv6SIDInfo) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
+type LsTLVMultiTopoID struct {
+	LsTLV
+	MultiTopoIDs []uint16
+}
+
+func (l *LsTLVMultiTopoID) DecodeFromBytes(data []byte) error {
+	tlv, err := l.LsTLV.DecodeFromBytes(data)
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < len(tlv); i += 2 {
+		if i+2 > len(tlv) {
+			return errors.New("TLV length mismatch")
+		}
+
+		multiTopoID := binary.BigEndian.Uint16(tlv[i:i+2]) & 0x0FFF
+		l.MultiTopoIDs = append(l.MultiTopoIDs, multiTopoID)
+	}
+	return nil
+}
+
+func (l *LsTLVMultiTopoID) Serialize() ([]byte, error) {
+	buf := []byte{}
+
+	for _, multiTopoID := range l.MultiTopoIDs {
+		bytes := make([]byte, 2)
+		binary.BigEndian.PutUint16(bytes, multiTopoID)
+		buf = append(buf, bytes...)
+	}
+
+	return l.LsTLV.Serialize(buf)
+}
+
+func (l *LsTLVMultiTopoID) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Type         LsTLVType `json:"type"`
+		MultiTopoIDs []uint16  `json:"multi_topo_ids"`
+	}{
+		l.Type,
+		l.MultiTopoIDs,
+	})
+}
+
+func (l *LsTLVMultiTopoID) Strings() []string {
+	multiTopoIDs := []string{}
+	for _, multiTopoID := range l.MultiTopoIDs {
+		multiTopoIDs = append(multiTopoIDs, fmt.Sprintf("%d", multiTopoID))
+	}
+
+	return multiTopoIDs
+}
+
+func (l *LsTLVMultiTopoID) String() string {
+	return fmt.Sprintf("{MultiTopoIDs: %s}", strings.Join(l.Strings(), ", "))
+}
+
+func (l *LsTLVMultiTopoID) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
+type LsSrv6SIDNLRI struct {
+	LsNLRI
+	LocalNodeDesc LsTLVInterface
+	MultiTopoID   LsTLVInterface
+	Srv6SIDInfo   LsTLVInterface
+}
+
+func (l *LsSrv6SIDNLRI) String() string {
+	local := l.LocalNodeDesc.(*LsTLVNodeDescriptor).Extract()
+	srv6SID := l.Srv6SIDInfo.(*LsTLVSrv6SIDInfo)
+	multiTopo := l.MultiTopoID.(*LsTLVMultiTopoID)
+
+	return fmt.Sprintf("SRv6SID { LOCAL_NODE: %s SRv6_SID: %v MULTI_TOPO_IDs: %v}", local, srv6SID.String(), multiTopo.String())
+}
+
+func (l *LsSrv6SIDNLRI) DecodeFromBytes(data []byte) error {
+	if err := l.LsNLRI.DecodeFromBytes(data); err != nil {
+		return nil
+	}
+
+	tlvs := data[lsNLRIHdrLen:]
+	m := make(map[LsTLVType]bool)
+
+	for len(tlvs) >= tlvHdrLen {
+		tlv := &LsTLV{}
+		_, err := tlv.DecodeFromBytes(tlvs)
+		if err != nil {
+			return err
+		}
+		m[tlv.Type] = true
+
+		var tLVInterface LsTLVInterface
+		switch tlv.Type {
+		case LS_TLV_LOCAL_NODE_DESC:
+			tLVInterface = &LsTLVNodeDescriptor{}
+		case LS_TLV_SRV6_SID_INFO:
+			tLVInterface = &LsTLVSrv6SIDInfo{}
+		case LS_TLV_MULTI_TOPO_ID:
+			tLVInterface = &LsTLVMultiTopoID{}
+		default:
+			tlvs = tlvs[tlv.Len():]
+			l.Length -= uint16(tlv.Len())
+			continue
+		}
+
+		if err := tLVInterface.DecodeFromBytes(tlvs); err != nil {
+			return err
+		}
+		tlvs = tlvs[tLVInterface.Len():]
+
+		switch tlv.Type {
+		case LS_TLV_LOCAL_NODE_DESC:
+			l.LocalNodeDesc = tLVInterface
+		case LS_TLV_SRV6_SID_INFO:
+			l.Srv6SIDInfo = tLVInterface
+		case LS_TLV_MULTI_TOPO_ID:
+			l.MultiTopoID = tLVInterface
+		}
+	}
+
+	required := []LsTLVType{LS_TLV_LOCAL_NODE_DESC, LS_TLV_SRV6_SID_INFO}
+	for _, tlv := range required {
+		if _, ok := m[tlv]; !ok {
+			return malformedAttrListErr("Required TLV missing")
+		}
+	}
+
+	return nil
+}
+
+func (l *LsSrv6SIDNLRI) Serialize() ([]byte, error) {
+	if l.LocalNodeDesc == nil || l.Srv6SIDInfo == nil {
+		return nil, errors.New("required TLV missing")
+	}
+	buf := make([]byte, 0)
+
+	s, err := l.LocalNodeDesc.Serialize()
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, s...)
+
+	s, err = l.Srv6SIDInfo.Serialize()
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, s...)
+
+	s, err = l.MultiTopoID.Serialize()
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, s...)
+
+	return l.LsNLRI.Serialize(buf)
+}
+
+func (l *LsSrv6SIDNLRI) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Type        LsNLRIType       `json:"type"`
+		LocalNode   LsNodeDescriptor `json:"local_node_desc"`
+		Srv6SID     LsTLVSrv6SIDInfo `json:"srv6_sid_info"`
+		MultiTopoID LsTLVMultiTopoID `json:"multi_topo"`
+	}{
+
+		Type:        l.Type(),
+		LocalNode:   *l.LocalNodeDesc.(*LsTLVNodeDescriptor).Extract(),
+		Srv6SID:     *l.Srv6SIDInfo.(*LsTLVSrv6SIDInfo),
+		MultiTopoID: *l.MultiTopoID.(*LsTLVMultiTopoID),
+	})
+}
+
 type LsTLVType uint16
 
 // Based on https://www.iana.org/assignments/bgp-ls-parameters/bgp-ls-parameters.xhtml
@@ -5864,6 +6096,7 @@ const (
 	LS_TLV_IGP_ROUTER_ID            = 515
 	LS_TLV_BGP_ROUTER_ID            = 516 // RFC9086
 	LS_TLV_BGP_CONFEDERATION_MEMBER = 517 // RFC9086
+	LS_TLV_SRV6_SID_INFO            = 518 // RFC9514
 
 	LS_TLV_NODE_FLAG_BITS        = 1024
 	LS_TLV_OPAQUE_NODE_ATTR      = 1025
@@ -5918,6 +6151,7 @@ type LsTLVInterface interface {
 	Serialize() ([]byte, error)
 	String() string
 	MarshalJSON() ([]byte, error)
+	GetLsTLV() LsTLV
 }
 
 func NewLsAttributeTLVs(lsAttr *LsAttribute) []LsTLVInterface {
@@ -6110,6 +6344,10 @@ func (l *LsTLVLinkID) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVLinkID) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVIPv4InterfaceAddr struct {
 	LsTLV
 	IP net.IP
@@ -6153,6 +6391,10 @@ func (l *LsTLVIPv4InterfaceAddr) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVIPv4InterfaceAddr) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVIPv4NeighborAddr struct {
 	LsTLV
 	IP net.IP
@@ -6194,6 +6436,10 @@ func (l *LsTLVIPv4NeighborAddr) MarshalJSON() ([]byte, error) {
 		Type:  l.Type,
 		Value: fmt.Sprintf("%v", l.IP),
 	})
+}
+
+func (l *LsTLVIPv4NeighborAddr) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsTLVIPv6InterfaceAddr struct {
@@ -6243,6 +6489,10 @@ func (l *LsTLVIPv6InterfaceAddr) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVIPv6InterfaceAddr) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVIPv6NeighborAddr struct {
 	LsTLV
 	IP net.IP
@@ -6288,6 +6538,10 @@ func (l *LsTLVIPv6NeighborAddr) MarshalJSON() ([]byte, error) {
 		Type:  l.Type,
 		Value: fmt.Sprintf("%v", l.IP),
 	})
+}
+
+func (l *LsTLVIPv6NeighborAddr) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 // https://tools.ietf.org/html/rfc7752#section-3.3.1.1
@@ -6394,6 +6648,10 @@ func (l *LsTLVNodeFlagBits) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVNodeFlagBits) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVNodeName struct {
 	LsTLV
 	Name string
@@ -6447,6 +6705,10 @@ func (l *LsTLVNodeName) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVNodeName) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVIsisArea struct {
 	LsTLV
 	Area []byte
@@ -6497,6 +6759,10 @@ func (l *LsTLVIsisArea) MarshalJSON() ([]byte, error) {
 		Type: l.Type,
 		Area: fmt.Sprintf("%v", l.Area),
 	})
+}
+
+func (l *LsTLVIsisArea) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsTLVLocalIPv4RouterID struct {
@@ -6552,6 +6818,10 @@ func (l *LsTLVLocalIPv4RouterID) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVLocalIPv4RouterID) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVRemoteIPv4RouterID struct {
 	LsTLV
 	IP net.IP
@@ -6603,6 +6873,10 @@ func (l *LsTLVRemoteIPv4RouterID) MarshalJSON() ([]byte, error) {
 		Type:  l.Type,
 		Value: fmt.Sprintf("%v", l.IP),
 	})
+}
+
+func (l *LsTLVRemoteIPv4RouterID) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsTLVLocalIPv6RouterID struct {
@@ -6658,6 +6932,10 @@ func (l *LsTLVLocalIPv6RouterID) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVLocalIPv6RouterID) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVRemoteIPv6RouterID struct {
 	LsTLV
 	IP net.IP
@@ -6711,6 +6989,10 @@ func (l *LsTLVRemoteIPv6RouterID) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVRemoteIPv6RouterID) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVOpaqueNodeAttr struct {
 	LsTLV
 	Attr []byte
@@ -6759,6 +7041,10 @@ func (l *LsTLVOpaqueNodeAttr) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVOpaqueNodeAttr) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVAutonomousSystem struct {
 	LsTLV
 	ASN uint32
@@ -6805,6 +7091,10 @@ func (l *LsTLVAutonomousSystem) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVAutonomousSystem) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVBgpLsID struct {
 	LsTLV
 	BGPLsID uint32
@@ -6849,6 +7139,10 @@ func (l *LsTLVBgpLsID) MarshalJSON() ([]byte, error) {
 		Type:    l.Type,
 		BgpLsID: l.BGPLsID,
 	})
+}
+
+func (l *LsTLVBgpLsID) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsTLVIgpRouterID struct {
@@ -6898,6 +7192,10 @@ func (l *LsTLVIgpRouterID) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVIgpRouterID) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVOspfAreaID struct {
 	LsTLV
 	AreaID uint32
@@ -6942,6 +7240,10 @@ func (l *LsTLVOspfAreaID) MarshalJSON() ([]byte, error) {
 		Type:   l.Type,
 		AreaID: l.AreaID,
 	})
+}
+
+func (l *LsTLVOspfAreaID) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsTLVBgpRouterID struct {
@@ -6996,6 +7298,10 @@ func (l *LsTLVBgpRouterID) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVBgpRouterID) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVBgpConfederationMember struct {
 	LsTLV
 	BgpConfederationMember uint32
@@ -7041,6 +7347,10 @@ func (l *LsTLVBgpConfederationMember) MarshalJSON() ([]byte, error) {
 		Type:                   l.Type,
 		BgpConfederationMember: l.BgpConfederationMember,
 	})
+}
+
+func (l *LsTLVBgpConfederationMember) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsOspfRouteType uint8
@@ -7124,6 +7434,10 @@ func (l *LsTLVOspfRouteType) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVOspfRouteType) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVIPReachability struct {
 	LsTLV
 	PrefixLength uint8
@@ -7201,6 +7515,10 @@ func (l *LsTLVIPReachability) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVIPReachability) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVAdminGroup struct {
 	LsTLV
 	AdminGroup uint32
@@ -7255,6 +7573,10 @@ func (l *LsTLVAdminGroup) MarshalJSON() ([]byte, error) {
 		Type:       l.Type,
 		AdminGroup: fmt.Sprintf("%08x", l.AdminGroup),
 	})
+}
+
+func (l *LsTLVAdminGroup) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsTLVMaxLinkBw struct {
@@ -7317,6 +7639,10 @@ func (l *LsTLVMaxLinkBw) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVMaxLinkBw) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVMaxReservableLinkBw struct {
 	LsTLV
 	Bandwidth float32
@@ -7375,6 +7701,10 @@ func (l *LsTLVMaxReservableLinkBw) MarshalJSON() ([]byte, error) {
 		Type:      l.Type,
 		Bandwidth: l.Bandwidth,
 	})
+}
+
+func (l *LsTLVMaxReservableLinkBw) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsTLVUnreservedBw struct {
@@ -7445,6 +7775,10 @@ func (l *LsTLVUnreservedBw) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVUnreservedBw) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVTEDefaultMetric struct {
 	LsTLV
 	Metric uint32
@@ -7499,6 +7833,10 @@ func (l *LsTLVTEDefaultMetric) MarshalJSON() ([]byte, error) {
 		Type:          l.Type,
 		DefaultMetric: l.Metric,
 	})
+}
+
+func (l *LsTLVTEDefaultMetric) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsTLVIGPMetric struct {
@@ -7578,6 +7916,10 @@ func (l *LsTLVIGPMetric) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVIGPMetric) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVLinkName struct {
 	LsTLV
 	Name string
@@ -7629,6 +7971,10 @@ func (l *LsTLVLinkName) MarshalJSON() ([]byte, error) {
 		Type: l.Type,
 		Name: l.Name,
 	})
+}
+
+func (l *LsTLVLinkName) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsTLVSrAlgorithm struct {
@@ -7683,6 +8029,10 @@ func (l *LsTLVSrAlgorithm) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVSrAlgorithm) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsSrLabelRange struct {
 	Range      uint32
 	FirstLabel LsTLVSIDLabel
@@ -7725,6 +8075,10 @@ func NewLsTLVSrCapabilities(l *LsSrCapabilities) *LsTLVSrCapabilities {
 		Flags:  flags,
 		Ranges: ranges,
 	}
+}
+
+func (l *LsTLVSrCapabilities) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsSrRange struct {
@@ -7986,6 +8340,10 @@ func (l *LsTLVSrLocalBlock) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVSrLocalBlock) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVAdjacencySID struct {
 	LsTLV
 	Flags  uint8
@@ -8068,6 +8426,10 @@ func (l *LsTLVAdjacencySID) MarshalJSON() ([]byte, error) {
 		Type: l.Type,
 		SID:  l.SID,
 	})
+}
+
+func (l *LsTLVAdjacencySID) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 // https://tools.ietf.org/html/rfc9086#section-5
@@ -8210,6 +8572,10 @@ func (l *LsTLVPeerNodeSID) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVPeerNodeSID) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVPeerAdjacencySID struct {
 	LsTLV
 	Flags  uint8
@@ -8301,6 +8667,10 @@ func (l *LsTLVPeerAdjacencySID) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVPeerAdjacencySID) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVPeerSetSID struct {
 	LsTLV
 	Flags  uint8
@@ -8390,6 +8760,10 @@ func (l *LsTLVPeerSetSID) MarshalJSON() ([]byte, error) {
 		Type: l.Type,
 		SID:  l.SID,
 	})
+}
+
+func (l *LsTLVPeerSetSID) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsTLVSIDLabel struct {
@@ -8536,6 +8910,10 @@ func (l *LsTLVPrefixSID) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVPrefixSID) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVSourceRouterID struct {
 	LsTLV
 	RouterID []byte
@@ -8627,6 +9005,10 @@ func (l *LsTLVOpaqueLinkAttr) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l LsTLVOpaqueLinkAttr) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVSrlg struct {
 	LsTLV
 	Srlgs []uint32
@@ -8688,6 +9070,10 @@ func (l *LsTLVSrlg) MarshalJSON() ([]byte, error) {
 		Type:  l.Type,
 		Value: l.Srlgs,
 	})
+}
+
+func (l *LsTLVSrlg) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsTLVIGPFlags struct {
@@ -8784,6 +9170,10 @@ func (l *LsTLVIGPFlags) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (l *LsTLVIGPFlags) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 type LsTLVOpaquePrefixAttr struct {
 	LsTLV
 	Attr []byte
@@ -8830,6 +9220,10 @@ func (l *LsTLVOpaquePrefixAttr) MarshalJSON() ([]byte, error) {
 		Type:  l.Type,
 		Value: fmt.Sprintf("%v", l.Attr),
 	})
+}
+
+func (l *LsTLVOpaquePrefixAttr) GetLsTLV() LsTLV {
+	return l.LsTLV
 }
 
 type LsTLVNodeDescriptor struct {
@@ -8972,6 +9366,10 @@ type LsNodeDescriptor struct {
 	BGPConfederationMember uint32 `json:"bgp_confederation_member"`
 }
 
+func (l *LsTLVNodeDescriptor) GetLsTLV() LsTLV {
+	return l.LsTLV
+}
+
 func (l *LsNodeDescriptor) String() string {
 
 	if l.BGPRouterID == nil {
@@ -9006,7 +9404,10 @@ func parseIGPRouterID(id []byte) (string, bool) {
 
 // Generate LsTLVNodeDescriptor from LsNodeDescriptor
 func NewLsTLVNodeDescriptor(nd *LsNodeDescriptor, tlvType LsTLVType) LsTLVNodeDescriptor {
+	// The sub-TLVs within a Node Descriptor MUST be arranged in ascending order by sub-TLV type.
 	subTLVs := []LsTLVInterface{}
+
+	// TLV Code Point 512 Autonomous System
 	// ASN 0 is invalid.
 	if nd.Asn != 0 {
 		subTLVs = append(subTLVs,
@@ -9019,7 +9420,39 @@ func NewLsTLVNodeDescriptor(nd *LsNodeDescriptor, tlvType LsTLVType) LsTLVNodeDe
 			})
 	}
 
+	// For IGP
+	if nd.IGPRouterID != "" {
+		routerIdBytes := []byte(nd.IGPRouterID)
+		routerIdLength := len([]byte(nd.IGPRouterID))
+		isOspf := false
+		// OSPF/OSPFv3 non-pseudonode or pseudonode
+		if routerIdLength == 4 || routerIdLength == 8 {
+			isOspf = true
+		}
+		if isOspf {
+			// TLV Code Point 514 OSPF Area-ID
+			subTLVs = append(subTLVs,
+				&LsTLVOspfAreaID{
+					LsTLV: LsTLV{
+						Type:   LS_TLV_OSPF_AREA,
+						Length: 4, // 4 is the only valid value.
+					},
+					AreaID: nd.OspfAreaID,
+				})
+		}
+		// TLV Code Point 515 IGP Router-ID
+		subTLVs = append(subTLVs,
+			&LsTLVIgpRouterID{
+				LsTLV: LsTLV{
+					Type:   LS_TLV_IGP_ROUTER_ID,
+					Length: uint16(routerIdLength),
+				},
+				RouterID: routerIdBytes,
+			})
+	}
+
 	// For BGP
+	// TLV Code Point 516 BGP Router-ID
 	if nd.BGPRouterID != nil {
 		subTLVs = append(subTLVs,
 			&LsTLVBgpRouterID{
@@ -9040,35 +9473,6 @@ func NewLsTLVNodeDescriptor(nd *LsNodeDescriptor, tlvType LsTLVType) LsTLVNodeDe
 				})
 		}
 	}
-	// For IGP
-	if nd.IGPRouterID != "" {
-		routerIdBytes := []byte(nd.IGPRouterID)
-		routerIdLength := len([]byte(nd.IGPRouterID))
-		subTLVs = append(subTLVs,
-			&LsTLVIgpRouterID{
-				LsTLV: LsTLV{
-					Type:   LS_TLV_IGP_ROUTER_ID,
-					Length: uint16(routerIdLength),
-				},
-				RouterID: routerIdBytes,
-			})
-		isOspf := false
-		// OSPF/OSPFv3 non-pseudonode or pseudonode
-		if routerIdLength == 4 || routerIdLength == 8 {
-			isOspf = true
-		}
-		if isOspf {
-			subTLVs = append(subTLVs,
-				&LsTLVOspfAreaID{
-					LsTLV: LsTLV{
-						Type:   LS_TLV_OSPF_AREA,
-						Length: 4, // 4 is the only valid value.
-					},
-					AreaID: nd.OspfAreaID,
-				})
-		}
-
-	}
 
 	subTLVs = append(subTLVs,
 		&LsTLVBgpLsID{
@@ -9078,6 +9482,10 @@ func NewLsTLVNodeDescriptor(nd *LsNodeDescriptor, tlvType LsTLVType) LsTLVNodeDe
 			},
 			BGPLsID: nd.BGPLsID,
 		})
+
+	sort.Slice(subTLVs, func(i, j int) bool {
+		return subTLVs[i].GetLsTLV().Type < subTLVs[j].GetLsTLV().Type
+	})
 
 	ndLength := 0
 	for _, val := range subTLVs {
@@ -9091,7 +9499,6 @@ func NewLsTLVNodeDescriptor(nd *LsNodeDescriptor, tlvType LsTLVType) LsTLVNodeDe
 		},
 		SubTLVs: subTLVs,
 	}
-
 }
 
 type LsAddrPrefix struct {
@@ -9146,6 +9553,14 @@ func (l *LsAddrPrefix) DecodeFromBytes(data []byte, options ...*MarshallingOptio
 		prefixv6.NLRIType = LS_NLRI_TYPE_PREFIX_IPV4
 		l.NLRI = prefixv6
 
+	// TODO: LS_NLRI_TYPE_SR_POLICY_CANDIDATE_PATH
+
+	case LS_NLRI_TYPE_SRV6_SID:
+		srv6sid := &LsSrv6SIDNLRI{}
+		srv6sid.Length = l.Length
+		srv6sid.NLRIType = LS_NLRI_TYPE_SRV6_SID
+		l.NLRI = srv6sid
+
 	default:
 		return malformedAttrListErr("Unsupported BGP-LS NLRI")
 	}
@@ -9169,7 +9584,7 @@ func (l *LsAddrPrefix) Serialize(options ...*MarshallingOption) ([]byte, error) 
 
 	buf := make([]byte, 4+len(ser))
 	binary.BigEndian.PutUint16(buf[:2], uint16(l.Type))
-	binary.BigEndian.PutUint16(buf[2:], l.Length)
+	binary.BigEndian.PutUint16(buf[2:4], uint16(len(ser)))
 	copy(buf[4:], ser)
 
 	return buf, nil
